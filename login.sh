@@ -77,21 +77,23 @@ case "$OUT" in
       echo ">>> 登录生效"
       OC="${OPENCLAW_BIN:-$(command -v openclaw || echo "$HOME/.npm-global/bin/openclaw")}"
       if [ -x "$OC" ]; then
-          if systemctl --user is-enabled openclaw-gateway.service >/dev/null 2>&1; then
-              systemctl --user start openclaw-gateway.service || true
-          else
-              "$OC" gateway install >/dev/null 2>&1 || true
-          fi
-          for i in $(seq 1 15); do
-              "$OC" gateway health >/dev/null 2>&1 && { echo ">>> OpenClaw Gateway 已就绪"; break; }
+          # 18789 只能有一个监听者：systemd 服务占着就先停掉，让这份带 --verbose 的进程接管
+          if systemctl --user is-active openclaw-gateway.service >/dev/null 2>&1; then
+              echo ">>> 停掉 systemd 的 gateway 服务，改由本终端前台运行（--verbose）"
+              systemctl --user stop openclaw-gateway.service || true
               sleep 2
-          done
-          if [ -t 0 ] && [ -t 1 ]; then
-              echo ">>> 进入 OpenClaw（Ctrl+C 退出）"
-              exec "$OC"
-          else
-              echo ">>> 当前不是交互终端，只拉起 Gateway；要用 TUI 请直接运行 openclaw"
           fi
+          echo ">>> 启动 OpenClaw Gateway: --port 18789 --verbose（日志在本终端，Ctrl+C 结束）"
+          "$OC" gateway --port 18789 --verbose &
+          GW_PID=$!
+          # 本机 gateway 冷启动实测要 ~35s，给足 80s
+          for i in $(seq 1 40); do
+              sleep 2
+              "$OC" gateway health >/dev/null 2>&1 && { echo ">>> Gateway 已就绪（约 $((i*2))s）"; break; }
+          done
+          echo ">>> 打开 OpenClaw Dashboard"
+          "$OC" dashboard || echo "!! dashboard 启动失败，可手动运行 openclaw dashboard"
+          wait "$GW_PID"
       else
           echo "!! 没找到 openclaw 命令（可用 OPENCLAW_BIN 指定），跳过自动启动"
       fi ;;
