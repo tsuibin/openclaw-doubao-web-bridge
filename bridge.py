@@ -40,6 +40,31 @@ SEL_NEW_CHAT = '[data-testid="create_conversation_button"]'
 SEL_MSG_TEXT = '[data-testid="message-text-content"]'   # 每条消息的纯文本
 SEL_MSG_FAILED = '[data-testid="message_box_failed_icon"]'
 
+# 读取输入框当前文本（用于校验插入是否生效）
+INPUT_TEXT_JS = """(sel) => {
+    const roots = [...document.querySelectorAll(sel)]
+        .filter(el => el.getBoundingClientRect().width > 0);
+    const root = roots[roots.length - 1] || document.querySelector(sel);
+    if (!root) return '';
+    const edit = root.matches('textarea, [contenteditable="true"]') ? root
+        : root.querySelector('textarea, [contenteditable="true"]');
+    if (!edit) return '';
+    return edit.tagName === 'TEXTAREA' ? edit.value : edit.innerText;
+}"""
+
+# 聚焦真正可编辑的节点：chat_input_input 可能是外层 div，可编辑节点在其内部
+FOCUS_JS = """(sel) => {
+    const roots = [...document.querySelectorAll(sel)]
+        .filter(el => el.getBoundingClientRect().width > 0);
+    const root = roots[roots.length - 1] || document.querySelector(sel);
+    if (!root) return false;
+    const edit = root.matches('textarea, [contenteditable="true"]') ? root
+        : root.querySelector('textarea, [contenteditable="true"]');
+    if (!edit) return false;
+    edit.focus();
+    return document.activeElement === edit || root.contains(document.activeElement);
+}"""
+
 
 class DoubaoSession:
     """单实例、串行化：网页 UI 天然不能并发，用锁排队。"""
@@ -73,25 +98,26 @@ class DoubaoSession:
                 await self._page.goto(self.cfg["doubao_url"], timeout=60000)
 
     async def _focus_input(self):
-        """用 JS 聚焦，避开 click 的 stability 检查（豆包输入框会被反复重建）。"""
+        """用 JS 聚焦，避开 click 的 stability 检查（豆包输入框会被反复重建）。
+
+        注意：chat_input_input 有时是外层容器 div（空会话/引导页），真正的可编辑节点
+        是它内部的 textarea 或 contenteditable div。直接对容器 focus() 无效，
+        document.querySelector 也可能先拿到隐藏节点，所以这里取"最后一个可见容器"
+        并下钻到可编辑节点。
+        """
         for i in range(10):
-            ok = await self._page.evaluate(
-                """(sel) => {
-                    const el = document.querySelector(sel);
-                    if (!el) return false;
-                    el.focus();
-                    return document.activeElement === el;
-                }""",
-                SEL_INPUT,
-            )
+            ok = await self._page.evaluate(FOCUS_JS, SEL_INPUT)
             if ok:
                 await self._page.wait_for_timeout(200)
                 return
-            # 兜底：force click
+            # 兜底：force click 内层可编辑节点
             try:
-                await self._page.locator(SEL_INPUT).first.click(force=True, timeout=3000)
+                await self._page.locator(
+                    f'{SEL_INPUT} textarea, {SEL_INPUT} [contenteditable="true"]'
+                ).last.click(force=True, timeout=3000)
                 await self._page.wait_for_timeout(300)
-                return
+                if await self._page.evaluate(FOCUS_JS, SEL_INPUT):
+                    return
             except Exception:
                 await self._page.wait_for_timeout(500)
         body = await self._page.inner_text("body")
@@ -131,9 +157,14 @@ class DoubaoSession:
             await self._focus_input()
             await self._page.keyboard.press("Control+A")
             await self._page.keyboard.press("Backspace")
-            # 必须走键盘输入，fill() 不会触发 React 的 onChange，发送按钮保持禁用
-            await self._page.keyboard.type(prompt, delay=20)
+            # 必须走键盘输入，fill() 不会触发 React 的 onChange，发送按钮保持禁用。
+            # 但 OpenClaw 的 prompt 带系统提示词/工具 schema，动辄几千字，逐字符 type
+            # 要几分钟；改用 insert_text 一次插入，插完校验，不生效再退回逐字符输入。
+            await self._page.keyboard.insert_text(prompt)
             await self._page.wait_for_timeout(300)
+            if not (await self._page.evaluate(INPUT_TEXT_JS, SEL_INPUT)):
+                await self._page.keyboard.type(prompt, delay=20)
+                await self._page.wait_for_timeout(300)
 
             n_before = await self._page.locator(SEL_MSG_TEXT).count()
             await self._page.keyboard.press("Enter")
