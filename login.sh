@@ -15,11 +15,30 @@ if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
 fi
 
 systemctl --user stop doubao-bridge.service || true
+# unit 若因 TimeoutStopSec 超时被 SIGKILL，浏览器来不及自己删单实例锁，
+# 下一次 Chromium 会以 "Failed to create .../SingletonLock" 直接 abort、窗口不弹。
+# SingletonLock 是指向 "hostname-pid" 的符号链接：pid 还活着说明真有人占着，别动；
+# 否则就是残留锁，清掉。
+lock="$PROFILE/SingletonLock"
+lock_pid=""
+if [ -L "$lock" ]; then
+    lock_pid="$(readlink "$lock")"
+    lock_pid="${lock_pid##*-}"
+fi
+if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    echo "!! profile 仍被 pid $lock_pid 占用，跳过锁清理（服务没停干净？）" >&2
+else
+    rm -f "$PROFILE/SingletonLock" "$PROFILE/SingletonCookie" "$PROFILE/SingletonSocket"
+fi
 echo ">>> profile: $PROFILE"
 echo ">>> 注意：要在这个新开的 Chromium 窗口里扫码登录（不是你平时的浏览器），"
 echo ">>>       等右上角出现头像/昵称后再关闭窗口。"
+# 必须和桥接用同一个 cookie 加密后端：桥接跑在 systemd user service 里，拿不到
+# 桌面 keyring，Chromium 会退回 basic（cookie 前缀 v10）；而桌面终端里的 Chromium
+# 默认用 keyring（v11）。两边不一致时，登录窗口写下的 cookie 桥接读不出来，
+# 豆包会立刻把会话降级成匿名。统一钉成 basic。
 "$CHROMIUM_PATH" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
-    https://www.doubao.com/chat/ || true
+    --password-store=basic https://www.doubao.com/chat/ || true
 
 echo ">>> 检查 profile 里的登录态"
 python3 - "$PROFILE" <<'PY' || true

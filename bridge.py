@@ -12,7 +12,9 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import time
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
@@ -26,6 +28,7 @@ CONFIG = {
     "chromium": os.environ.get("CHROMIUM_PATH", "/usr/local/bin/chromium"),
     "profile_dir": os.environ.get("DOUBAO_PROFILE_DIR", os.path.expanduser("~/.doubao-web-profile")),
     "headless": os.environ.get("HEADLESS", "1") == "1",
+    "cdp_port": int(os.environ.get("CDP_PORT", "9222")),
     "doubao_url": os.environ.get("DOUBAO_URL", "https://www.doubao.com/chat/"),
     # 行为
     "new_chat_each_request": os.environ.get("NEW_CHAT_EACH_REQUEST", "1") == "1",
@@ -37,7 +40,8 @@ CONFIG = {
 # 已观测到的真实节点（2026-11 实测）
 SEL_INPUT = '[data-testid="chat_input_input"]'            # 输入框：可能是 textarea，也可能是 contenteditable div
 SEL_NEW_CHAT = '[data-testid="create_conversation_button"]'
-SEL_MSG_TEXT = '[data-testid="message-text-content"]'   # 每条消息的纯文本
+# 每条消息的纯文本。2026-11 页面改版后 testid 变成下划线，旧版保留兜底
+SEL_MSG_TEXT = '[data-testid="message_text_content"], [data-testid="message-text-content"]'
 SEL_MSG_FAILED = '[data-testid="message_box_failed_icon"]'
 
 # 读取输入框当前文本（用于校验插入是否生效）
@@ -74,20 +78,71 @@ class DoubaoSession:
         self._pw = None
         self._browser = None
         self._page = None
+        self._proc = None
         self._lock = asyncio.Lock()
 
     async def start(self):
+        """自己起一个普通 Chromium，再用 CDP 接管。
+
+        不能用 playwright 的 launch_*：它带进去的 --enable-automation 等参数会被豆包
+        风控识别，发送请求直接回 SSE 710022004 "rate limited"（decision.type=verify），
+        而同一个 profile 用普通参数启动的浏览器能正常对话。所以这里手动 Popen，
+        再 connect_over_cdp 只借用它的调试接口。
+        """
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch_persistent_context(
-            user_data_dir=self.cfg["profile_dir"],
-            executable_path=self.cfg["chromium"],
-            headless=self.cfg["headless"],
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-            viewport={"width": 1440, "height": 900},
+        self._launch_chromium()
+        self._browser = await self._pw.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{self.cfg['cdp_port']}"
         )
-        self._page = self._browser.pages[0] if self._browser.pages else await self._browser.new_page()
-        await self._page.goto(self.cfg["doubao_url"], timeout=60000)
+        ctx = self._browser.contexts[0]
+        self._page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await self._page.wait_for_selector(SEL_INPUT, timeout=60000)
+
+    def _launch_chromium(self):
+        profile = self.cfg["profile_dir"]
+        lock = os.path.join(profile, "SingletonLock")
+        if os.path.islink(lock):
+            pid = os.readlink(lock).rsplit("-", 1)[-1]
+            if pid.isdigit() and os.path.exists(f"/proc/{pid}"):
+                raise RuntimeError(f"profile 正被 pid {pid} 占用（login.sh 的窗口还开着？）")
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            try:
+                os.unlink(os.path.join(profile, name))
+            except OSError:
+                pass
+
+        args = [
+            self.cfg["chromium"],
+            f"--user-data-dir={profile}",
+            f"--remote-debugging-port={self.cfg['cdp_port']}",
+            "--no-first-run", "--no-default-browser-check",
+            # 见 login.sh：cookie 加密后端必须和登录时一致，否则读不出登录态
+            "--password-store=basic",
+            "--no-sandbox", "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1440,900",
+            # headless 的 UA 里带 HeadlessChrome，豆包会按自动化处理
+            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        ]
+        if self.cfg["headless"]:
+            args.append("--headless=new")
+        args.append(self.cfg["doubao_url"])
+        self._proc = subprocess.Popen(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._wait_cdp()
+
+    def _wait_cdp(self):
+        url = f"http://127.0.0.1:{self.cfg['cdp_port']}/json/version"
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen(url, timeout=1):
+                    return
+            except Exception:
+                time.sleep(1)
+        raise RuntimeError("Chromium 的 CDP 端口没起来")
 
     async def _ensure_input(self):
         for _ in range(3):
@@ -180,7 +235,10 @@ class DoubaoSession:
                     return {
                         "ok": False,
                         "error": "send_failed",
-                        "detail": "豆包网页版未登录或会话失效（页面出现发送失败标记）。请先在桥接浏览器里完成登录。",
+                        # 两种情况都会渲染这个失败图标：没登录，或被风控限流
+                        # （/chat/completion 回 SSE STREAM_ERROR 710022004 "rate limited"，
+                        #  decision.type=verify，需要在网页里人工验证或等冷却）。
+                        "detail": "豆包返回发送失败：未登录/会话失效，或账号被限流（rate limited，常见于自动化调用）。请在豆包网页里手动发一条消息确认能正常回复，必要时完成验证。",
                     }
 
                 cur = await self._read_last_assistant()
@@ -199,7 +257,17 @@ class DoubaoSession:
     async def close(self):
         try:
             if self._browser:
-                await self._browser.close()
+                await self._browser.close()   # CDP 连接，只是断开
+        except Exception:
+            pass
+        proc = self._proc
+        if proc and proc.poll() is None:
+            proc.terminate()                  # 正常退出才会把 cookie 落盘
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
             if self._pw:
                 await self._pw.stop()
         except Exception:
