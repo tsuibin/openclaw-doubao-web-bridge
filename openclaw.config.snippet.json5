@@ -1,0 +1,37 @@
+// OpenClaw 自定义 provider：把豆包网页版桥接当成一个 OpenAI 兼容后端
+// 放入 ~/.openclaw/openclaw.json5（或 openclaw config 编辑）
+{
+  models: {
+    providers: {
+      "doubao-web": {
+        baseUrl: "http://127.0.0.1:8799/v1",
+        apiKey: "not-needed",
+        api: "openai-completions",
+        models: [
+          {
+            id: "doubao-web",
+            name: "Doubao (Web Bridge)",
+            // 网页版目前只把文本喂进去，图片不生效
+            input: ["text"],
+            contextWindow: 32000,
+          },
+        ],
+      },
+    },
+  },
+
+  agents: {
+    defaults: {
+      model: {
+        // 需要极强代码能力时用方舟官方 doubao-seed-code；
+        // 想零成本复用网页版额度时切到这个
+        primary: "doubao-web/doubao-web",
+      },
+      // 网页版没有原生 FunctionCall，桥接靠 prompt 约定 <tool_call> 解析，
+      // 稳定性明显低于官方 API，建议只开放低风险工具
+      tools: {
+        deny: ["exec", "shell", "write", "delete"],
+      },
+    },
+  },
+}

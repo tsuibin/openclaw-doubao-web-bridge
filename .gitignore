@@ -1,0 +1,6 @@
+# 豆包网页版登录态（绝对不要提交）
+.doubao-web-profile/
+profile/
+*.log
+__pycache__/
+.venv/
