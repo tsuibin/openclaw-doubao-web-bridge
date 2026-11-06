@@ -74,8 +74,27 @@ OUT=$(curl -sS -m 200 -X POST http://127.0.0.1:8799/v1/probe || true)
 echo "$OUT"
 case "$OUT" in
   *'"ok":true'*)
-      echo ">>> 登录生效。可以把 OpenClaw 默认模型切过去："
-      echo "    openclaw config set agents.defaults.model.primary doubao-web/doubao-web" ;;
+      echo ">>> 登录生效"
+      OC="${OPENCLAW_BIN:-$(command -v openclaw || echo "$HOME/.npm-global/bin/openclaw")}"
+      if [ -x "$OC" ]; then
+          if systemctl --user is-enabled openclaw-gateway.service >/dev/null 2>&1; then
+              systemctl --user start openclaw-gateway.service || true
+          else
+              "$OC" gateway install >/dev/null 2>&1 || true
+          fi
+          for i in $(seq 1 15); do
+              "$OC" gateway health >/dev/null 2>&1 && { echo ">>> OpenClaw Gateway 已就绪"; break; }
+              sleep 2
+          done
+          if [ -t 0 ] && [ -t 1 ]; then
+              echo ">>> 进入 OpenClaw（Ctrl+C 退出）"
+              exec "$OC"
+          else
+              echo ">>> 当前不是交互终端，只拉起 Gateway；要用 TUI 请直接运行 openclaw"
+          fi
+      else
+          echo "!! 没找到 openclaw 命令（可用 OPENCLAW_BIN 指定），跳过自动启动"
+      fi ;;
   *)
       echo ">>> 登录仍未生效。确认是在上面那个 Chromium 窗口里扫码的，而不是平时的浏览器；" 
       echo "    如果窗口没弹出来，说明当前终端没有图形会话。" ;;
